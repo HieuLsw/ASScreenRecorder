@@ -14,14 +14,26 @@
 #define SYSTEM_VERSION_GREATER_THAN_OR_EQUAL_TO(v)  ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] != NSOrderedAscending)
 #define SYSTEM_VERSION_LESS_THAN(v)                 ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] == NSOrderedAscending)
 
-@interface ASScreenRecorder()
+@interface ASScreenRecorder()<AVCaptureAudioDataOutputSampleBufferDelegate>
+
 @property (strong, nonatomic) AVAssetWriter *videoWriter;
 @property (strong, nonatomic) AVAssetWriterInput *videoWriterInput;
 @property (strong, nonatomic) AVAssetWriterInputPixelBufferAdaptor *avAdaptor;
 @property (strong, nonatomic) CADisplayLink *displayLink;
 @property (strong, nonatomic) NSDictionary *outputBufferPoolAuxAttributes;
+
+@property (nonatomic) AVCaptureDeviceInput		*audioCaptureInput;
+@property (nonatomic) AVAssetWriterInput		*audioInput;
+@property (nonatomic) AVCaptureAudioDataOutput	*audioCaptureOutput;
+@property (nonatomic) AVCaptureSession			*captureSession;
+@property (nonatomic) NSDictionary				*audioSettings;
+
+@property (nonatomic) CMTime					firstAudioTimeStamp;
+@property (nonatomic) NSDate					*startedAt;
+
 @property (nonatomic) CFTimeInterval firstTimeStamp;
 @property (nonatomic) BOOL isRecording;
+@property (nonatomic) bool stopRequested;
 
 @property (strong, nonatomic) NSMutableArray *pauseResumeTimeRanges;
 
@@ -63,13 +75,14 @@
             _scale = 1.0;
         }
         _isRecording = NO;
-        
+        _stopRequested = NO;
         _append_pixelBuffer_queue = dispatch_queue_create("ASScreenRecorder.append_queue", DISPATCH_QUEUE_SERIAL);
         _render_queue = dispatch_queue_create("ASScreenRecorder.render_queue", DISPATCH_QUEUE_SERIAL);
         dispatch_set_target_queue(_render_queue, dispatch_get_global_queue( DISPATCH_QUEUE_PRIORITY_HIGH, 0));
         _frameRenderingSemaphore = dispatch_semaphore_create(1);
         _pixelAppendSemaphore = dispatch_semaphore_create(1);
         _fps = 60;
+        [self setUpAudioCapture];
     }
     return self;
 }
@@ -120,6 +133,7 @@
 {
     if (_isRecording) {
         _isRecording = NO;
+        _stopRequested = YES;
         [_displayLink removeFromRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
         [self completeRecordingSession:completionBlock];
         self.pauseResumeTimeRanges = nil;
@@ -177,8 +191,27 @@
     
     [_videoWriter addInput:_videoWriterInput];
     
+    
+    NSLog(@"assetWriterInputWithMediaType audio");
+    _audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:_audioSettings];
+    if (!_audioInput)
+    {
+        //        _movieWriter = nil;
+        //        _videoInput = nil;
+        //        _videoAdaptor = nil;
+        //        NSParameterAssert(_audioInput);
+        //        return false;
+    }
+    _audioInput.expectsMediaDataInRealTime = YES;
+    
+    NSLog(@"canAddInput audio");
+    NSParameterAssert([_videoWriter canAddInput:_audioInput]);
+    [_videoWriter addInput:_audioInput];
+
+    
     [_videoWriter startWriting];
-    [_videoWriter startSessionAtSourceTime:CMTimeMake(0, 1000)];
+    float millisElapsed = [[NSDate date] timeIntervalSinceDate:_startedAt] * 1000.0;
+    [_videoWriter startSessionAtSourceTime:CMTimeAdd(_firstAudioTimeStamp, CMTimeMake(millisElapsed, 1000.0f))];
 }
 
 - (CGAffineTransform)videoTransformForDeviceOrientation
@@ -279,7 +312,7 @@
         if (!self.firstTimeStamp) {
             self.firstTimeStamp = _displayLink.timestamp;
         }
-        CFTimeInterval elapsed = (_displayLink.timestamp - self.firstTimeStamp);
+        CFTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:_startedAt] * 1000.0;
         if (self.pauseResumeTimeRanges.count) {
             for (int i = 0; i < self.pauseResumeTimeRanges.count; i += 2) {
                 double pausedTime = [self.pauseResumeTimeRanges[i] doubleValue];
@@ -365,5 +398,90 @@
     
     return bitmapContext;
 }
+
+# pragma mark - audio recording
+
+- (void) setUpAudioCapture
+{
+    NSError *error;
+    
+    AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+    if (device && device.connected)
+        NSLog(@"Connected Device: %@", device.localizedName);
+    else
+    {
+        NSLog(@"AVCaptureDevice Failed");
+        return;
+    }
+    
+    // add device inputs
+    _audioCaptureInput = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
+    if (!_audioCaptureInput)
+    {
+        NSLog(@"AVCaptureDeviceInput Failed");
+        return;
+    }
+    if (error)
+    {
+        NSLog(@"%@", error);
+        return;
+    }
+    
+    // add output for audio
+    _audioCaptureOutput = [[AVCaptureAudioDataOutput alloc] init];
+    if (!_audioCaptureOutput)
+    {
+        NSLog(@"AVCaptureMovieFileOutput Failed");
+        return;
+    }
+    dispatch_queue_t audioCaptureQueue = dispatch_queue_create("AudioCaptureQueue", NULL);
+    [_audioCaptureOutput setSampleBufferDelegate:self queue:audioCaptureQueue];
+    
+    _captureSession = [[AVCaptureSession alloc] init];
+    if (!_captureSession)
+    {
+        NSLog(@"AVCaptureSession Failed");
+        return;
+    }
+    _captureSession.sessionPreset = AVCaptureSessionPresetMedium;
+    if ([_captureSession canAddInput:_audioCaptureInput])
+        [_captureSession addInput:_audioCaptureInput];
+    else
+    {
+        NSLog(@"Failed to add input device to capture session");
+        return;
+    }
+    if ([_captureSession canAddOutput:_audioCaptureOutput])
+        [_captureSession addOutput:_audioCaptureOutput];
+    else
+    {
+        NSLog(@"Failed to add output device to capture session");
+        return;
+    }
+    
+    _audioSettings = [_audioCaptureOutput recommendedAudioSettingsForAssetWriterWithOutputFileType:AVFileTypeMPEG4];
+    
+    [_captureSession startRunning];
+    
+    NSLog(@"Audio capture session running");
+}
+
+- (void)captureOutput:(AVCaptureOutput *)captureOutput didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection
+{
+    if (captureOutput == _audioCaptureOutput)
+    {
+        if (_startedAt == nil)
+        {
+            _startedAt = [NSDate date];
+            _firstAudioTimeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        }
+        
+        if (_isRecording && !_stopRequested && [_audioInput isReadyForMoreMediaData])
+        {
+            [_audioInput appendSampleBuffer:sampleBuffer];
+        }
+    }
+}
+
 
 @end
